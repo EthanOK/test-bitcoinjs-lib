@@ -33,6 +33,22 @@ describe("创建 BTC 地址", () => {
     3,
   );
 
+  const derivedKeys_testnet_coinType = getDerivedKeysFromMnemonic(
+    {
+      mnemonic: mnemonic,
+      network: "testnet",
+      addressType: "p2wpkh",
+      coinType: 1, // electrum testnet
+    },
+    3,
+    true,
+  );
+
+  console.log(
+    "electrum testnet change addresses:",
+    derivedKeys_testnet_coinType.map((key) => key.address),
+  );
+
   it("P2WPKH (mainnet/testnet) - 由 BIP173 示例 program 生成 bech32 地址", () => {
     const pubkey_mainnet_0 = Buffer.from(
       derivedKeys_mainnet[0].publicKeyHex,

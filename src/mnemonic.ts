@@ -109,11 +109,19 @@ export function deriveBtcFromMnemonic(
 
 export function getDerivedKeysFromMnemonic(
   params: DeriveFromMnemonicParams,
-  count: number,
+  count = 1,
+  change = false,
 ): DerivedKeyInfo[] {
   const keys: DerivedKeyInfo[] = [];
+  if (change) {
+    keys.push(deriveBtcFromMnemonic({ ...params, change: 0, index: 0 }));
+  }
   for (let i = 0; i < count; i++) {
-    keys.push(deriveBtcFromMnemonic({ ...params, index: i }));
+    if (change) {
+      keys.push(deriveBtcFromMnemonic({ ...params, change: 1, index: i }));
+    } else {
+      keys.push(deriveBtcFromMnemonic({ ...params, index: i }));
+    }
   }
   return keys;
 }
