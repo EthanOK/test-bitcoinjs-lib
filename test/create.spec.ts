@@ -4,6 +4,12 @@ import { address, initEccLib, networks, payments, Psbt } from "bitcoinjs-lib";
 import { getDerivedKeysFromMnemonic } from "../src/mnemonic";
 import dotenv from "dotenv";
 import { ECPairFactory } from "ecpair";
+import {
+  fetchFeeRateSatPerVb,
+  fetchUtxos,
+  mockPostGetPartialSig,
+  Utxo,
+} from "./utils";
 dotenv.config();
 
 initEccLib(ecc);
@@ -157,40 +163,6 @@ describe("创建 BTC 地址", () => {
     const shouldBroadcast =
       (process.env.TESTNET_BROADCAST ?? "").trim() === "1";
 
-    type Utxo = { txid: string; vout: number; value: number };
-    type RecommendedFees = {
-      fastestFee: number;
-      halfHourFee: number;
-      hourFee: number;
-      economyFee: number;
-      minimumFee: number;
-    };
-
-    async function fetchUtxos(addr: string): Promise<Utxo[]> {
-      const url = `https://mempool.space/testnet/api/address/${addr}/utxo`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(
-          `拉取 UTXO 失败 ${res.status} ${res.statusText}: ${txt}`,
-        );
-      }
-      return (await res.json()) as Utxo[];
-    }
-
-    async function fetchFeeRateSatPerVb(): Promise<number> {
-      const url = "https://mempool.space/testnet/api/v1/fees/recommended";
-      const res = await fetch(url);
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`拉取费率失败 ${res.status} ${res.statusText}: ${txt}`);
-      }
-      const fees = (await res.json()) as RecommendedFees;
-      const fr = fees.fastestFee;
-      if (!Number.isFinite(fr) || fr <= 0) throw new Error("推荐费率无效");
-      return fr;
-    }
-
     // 选择 UTXO：始终自动从接口拉取并挑一个够用的最大 UTXO（不要求任何 UTXO env 配置）
     let utxos: Utxo[];
     try {
@@ -212,7 +184,7 @@ describe("创建 BTC 地址", () => {
     }
     utxos.sort((a, b) => b.value - a.value);
     // 先用占位费（会在拿到 vsize 后回算真实 fee）
-    const feePadding = 2000n;
+    const feePadding = 200n;
     const need = amountSats + feePadding + 1n; // 至少要覆盖 amount+fee(占位)
     const picked = utxos.find((u) => BigInt(u.value) >= need) ?? utxos[0];
 
@@ -231,7 +203,7 @@ describe("创建 BTC 地址", () => {
         throw new Error(`自动拉费率失败（已开启广播且严格模式）：${msg}`);
       }
       // 兜底费率：避免仅因费率接口失败导致无法构造 rawtx
-      feeRate = 5;
+      feeRate = 2;
       console.log(`费率接口失败，使用兜底 feeRate=5 sat/vB：${msg}`);
     }
 
@@ -243,8 +215,109 @@ describe("创建 BTC 地址", () => {
       Buffer.from(derivedKeys_testnet_local[1].privateKeyHex, "hex"),
       { network: networks.testnet },
     );
+    const key2 = ECPair.fromPrivateKey(
+      Buffer.from(derivedKeys_testnet_local[2].privateKeyHex, "hex"),
+      { network: networks.testnet },
+    );
+    const participants = [
+      { name: "user0", keyPair: key0, keyInfo: derivedKeys_testnet_local[0] },
+      { name: "user1", keyPair: key1, keyInfo: derivedKeys_testnet_local[1] },
+      { name: "user2", keyPair: key2, keyInfo: derivedKeys_testnet_local[2] },
+    ];
+    console.log(
+      "multisig participants",
+      participants.map((p) => ({
+        name: p.name,
+        address: p.keyInfo.address,
+        pubkey: p.keyInfo.publicKeyHex,
+      })),
+    );
 
-    const build = (feeSats: bigint) => {
+    /**
+     * 用 dummy 最大尺寸签名填充未签名 PSBT 的副本，让 bitcoinjs-lib 直接算
+     * virtualSize，全程无需任何真实签名方参与。
+     *
+     * 支持的 input 类型（从 PSBT 结构自动识别，无硬编码）：
+     *   - P2WSH multisig：从 witnessScript[0]（OP_m）读取需要几个签名
+     *   - P2WPKH：1 dummy sig + 1 dummy pubkey
+     */
+    const estimateVsizeWithDummySigs = (unsignedPsbt: Psbt): number => {
+      // witness stack 二进制序列化（仅处理单项 < 253B 的常规情况）
+      const serializeWitness = (items: Buffer[]): Buffer =>
+        Buffer.concat([
+          Buffer.from([items.length]),
+          ...items.flatMap((item) => [Buffer.from([item.length]), item]),
+        ]);
+
+      const probe = Psbt.fromHex(unsignedPsbt.toHex(), {
+        network: networks.testnet,
+      });
+
+      for (let i = 0; i < probe.data.inputs.length; i++) {
+        probe.finalizeInput(i, (_idx, inp) => {
+          const empty = Buffer.alloc(0);
+          if (inp.witnessScript) {
+            const m = inp.witnessScript[0] - 0x50;
+            const dummySig = Buffer.alloc(73); // max DER(72) + sighash type(1)
+            return {
+              finalScriptSig: empty,
+              finalScriptWitness: serializeWitness([
+                empty, // CHECKMULTISIG 占位空项
+                ...Array.from({ length: m }, () => dummySig),
+                inp.witnessScript,
+              ]),
+            };
+          }
+          if (inp.witnessUtxo) {
+            const s = inp.witnessUtxo.script;
+            if (s.length === 22 && s[0] === 0x00 && s[1] === 0x14) {
+              return {
+                finalScriptSig: empty,
+                finalScriptWitness: serializeWitness([
+                  Buffer.alloc(73), // dummy sig
+                  Buffer.alloc(33), // dummy compressed pubkey
+                ]),
+              };
+            }
+          }
+          // 兜底：返回空，让 bitcoinjs-lib 走默认逻辑
+          return { finalScriptSig: empty, finalScriptWitness: empty };
+        });
+      }
+
+      return probe.extractTransaction().virtualSize();
+    };
+
+    // 构建仅用于 vsize 评估的未签名 PSBT（不涉及任何签名方）
+    const buildUnsignedPsbt = (withChange: boolean): Psbt => {
+      const psbt = new Psbt({ network: networks.testnet });
+      psbt.addInput({
+        hash: utxoTxid,
+        index: utxoVout,
+        witnessUtxo: { script: p2wsh.output!, value: utxoValueSats },
+        witnessScript: p2ms.output!,
+      });
+      psbt.addOutput({ address: to_address, value: amountSats });
+      if (withChange) {
+        psbt.addOutput({ address: p2wsh_address, value: 1n }); // 仅占位，影响结构
+      }
+      return psbt;
+    };
+
+    // 先判断有无找零，算出最终手续费，之后只发起一轮远端签名
+    const feeWithChange = BigInt(
+      Math.ceil(estimateVsizeWithDummySigs(buildUnsignedPsbt(true)) * feeRate),
+    );
+    const hasChange = utxoValueSats - amountSats - feeWithChange > 0n;
+    const finalFeeSats = hasChange
+      ? feeWithChange
+      : BigInt(
+          Math.ceil(
+            estimateVsizeWithDummySigs(buildUnsignedPsbt(false)) * feeRate,
+          ),
+        );
+
+    const build = async (feeSats: bigint) => {
       const change = utxoValueSats - amountSats - feeSats;
       if (change < 0n) {
         throw new Error(
@@ -266,21 +339,46 @@ describe("创建 BTC 地址", () => {
       if (change > 0n) {
         psbt.addOutput({ address: p2wsh_address, value: change });
       }
-      psbt.signInput(0, key0);
-      psbt.signInput(0, key1);
+
+      const unsignedPsbtHex = psbt.toHex();
+      // 从 3 个签名方里随机选 2 个拿 partialSig（2-of-3）
+      const signerPool = [...participants];
+      signerPool.sort(() => Math.random() - 0.5);
+      const pickedSigners = signerPool.slice(0, 2);
+      console.log(
+        "picked signers",
+        pickedSigners.map((p) => ({
+          name: p.name,
+          address: p.keyInfo.address,
+          pubkey: p.keyInfo.publicKeyHex,
+        })),
+      );
+      const partialSigs = await Promise.all(
+        pickedSigners.map((p) =>
+          mockPostGetPartialSig(unsignedPsbtHex, p.keyPair),
+        ),
+      );
+
+      psbt.updateInput(0, { partialSig: partialSigs });
       psbt.finalizeAllInputs();
       return { psbt, change };
     };
 
-    const { psbt: psbt1 } = build(feePadding);
-    const vsize = psbt1.extractTransaction(false).virtualSize();
-    const feeSats = BigInt(Math.ceil(vsize * feeRate));
-    const { psbt, change } =
-      feeSats === feePadding ? build(feePadding) : build(feeSats);
+    const { psbt, change } = await build(finalFeeSats);
 
     const tx = psbt.extractTransaction();
     const rawtx = tx.toHex();
     const txid = tx.getId();
+    const actualFeeSats =
+      utxoValueSats - tx.outs.reduce((sum, out) => sum + BigInt(out.value), 0n);
+    const actualVsize = tx.virtualSize();
+    const actualFeeRate = Number(actualFeeSats) / actualVsize;
+
+    console.log("withdraw:", {
+      feeSats: actualFeeSats.toString(),
+      feeRate: actualFeeRate.toFixed(2),
+      txid,
+    });
 
     if (shouldBroadcast) {
       const broadcastUrl =
