@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
 import * as ecc from "tiny-secp256k1";
-import { address, initEccLib, networks, payments, Psbt } from "bitcoinjs-lib";
+import { address, initEccLib, networks, payments } from "bitcoinjs-lib";
 import { getDerivedKeysFromMnemonic } from "../src/mnemonic";
 import dotenv from "dotenv";
 import { ECPairFactory } from "ecpair";
 import {
+  buildPsbt,
+  buildUnsignedPsbt,
+  estimateVsizeWithDummySigs,
   fetchFeeRateSatPerVb,
   fetchUtxos,
-  mockPostGetPartialSig,
   Utxo,
 } from "./utils";
 dotenv.config();
@@ -128,14 +130,6 @@ describe("创建 BTC 地址", () => {
   });
 
   it("P2WSH (testnet) - (n-1)-of-n multisig withdraw 0.0001 btc from p2wsh", async () => {
-    // 这个用例支持“真的构造并签名一笔 testnet 交易”（不广播）。
-    // 为避免 CI/离线环境不稳定，这里不自动请求网络拉 UTXO；
-    // 你在 .env 里提供一个可花费 UTXO 后，此用例就会产出 rawtx 供你自行广播。
-    //
-    // 可选：
-    // - TESTNET_TO_ADDRESS: 收款地址（默认用下面的示例地址）
-    // - TESTNET_FEE_SATS: 手续费（默认 500 sats）
-    // - TESTNET_BROADCAST: 是否广播（默认不广播）
     const derivedKeys_testnet_local = getDerivedKeysFromMnemonic(
       {
         mnemonic,
@@ -154,6 +148,11 @@ describe("创建 BTC 地址", () => {
     });
     const p2wsh = payments.p2wsh({ redeem: p2ms, network: networks.testnet });
     const p2wsh_address = p2wsh.address!;
+    const p2wshContext = {
+      address: p2wsh_address,
+      output: p2wsh.output!,
+      witnessScript: p2ms.output!,
+    };
     console.log("p2wsh_address", p2wsh_address);
 
     // 100-1000 sats 随机金额
@@ -188,9 +187,11 @@ describe("创建 BTC 地址", () => {
     const need = amountSats + feePadding + 1n; // 至少要覆盖 amount+fee(占位)
     const picked = utxos.find((u) => BigInt(u.value) >= need) ?? utxos[0];
 
-    const utxoTxid = picked.txid;
-    const utxoVout = picked.vout;
-    const utxoValueSats = BigInt(picked.value);
+    const targetUtxo = {
+      txid: picked.txid,
+      vout: picked.vout,
+      valueSats: BigInt(picked.value),
+    };
 
     let feeRate: number;
     try {
@@ -233,144 +234,51 @@ describe("创建 BTC 地址", () => {
       })),
     );
 
-    /**
-     * 用 dummy 最大尺寸签名填充未签名 PSBT 的副本，让 bitcoinjs-lib 直接算
-     * virtualSize，全程无需任何真实签名方参与。
-     *
-     * 支持的 input 类型（从 PSBT 结构自动识别，无硬编码）：
-     *   - P2WSH multisig：从 witnessScript[0]（OP_m）读取需要几个签名
-     *   - P2WPKH：1 dummy sig + 1 dummy pubkey
-     */
-    const estimateVsizeWithDummySigs = (unsignedPsbt: Psbt): number => {
-      // witness stack 二进制序列化（仅处理单项 < 253B 的常规情况）
-      const serializeWitness = (items: Buffer[]): Buffer =>
-        Buffer.concat([
-          Buffer.from([items.length]),
-          ...items.flatMap((item) => [Buffer.from([item.length]), item]),
-        ]);
-
-      const probe = Psbt.fromHex(unsignedPsbt.toHex(), {
-        network: networks.testnet,
-      });
-
-      for (let i = 0; i < probe.data.inputs.length; i++) {
-        probe.finalizeInput(i, (_idx, inp) => {
-          const empty = Buffer.alloc(0);
-          if (inp.witnessScript) {
-            const m = inp.witnessScript[0] - 0x50;
-            const dummySig = Buffer.alloc(73); // max DER(72) + sighash type(1)
-            return {
-              finalScriptSig: empty,
-              finalScriptWitness: serializeWitness([
-                empty, // CHECKMULTISIG 占位空项
-                ...Array.from({ length: m }, () => dummySig),
-                inp.witnessScript,
-              ]),
-            };
-          }
-          if (inp.witnessUtxo) {
-            const s = inp.witnessUtxo.script;
-            if (s.length === 22 && s[0] === 0x00 && s[1] === 0x14) {
-              return {
-                finalScriptSig: empty,
-                finalScriptWitness: serializeWitness([
-                  Buffer.alloc(73), // dummy sig
-                  Buffer.alloc(33), // dummy compressed pubkey
-                ]),
-              };
-            }
-          }
-          // 兜底：返回空，让 bitcoinjs-lib 走默认逻辑
-          return { finalScriptSig: empty, finalScriptWitness: empty };
-        });
-      }
-
-      return probe.extractTransaction().virtualSize();
-    };
-
-    // 构建仅用于 vsize 评估的未签名 PSBT（不涉及任何签名方）
-    const buildUnsignedPsbt = (withChange: boolean): Psbt => {
-      const psbt = new Psbt({ network: networks.testnet });
-      psbt.addInput({
-        hash: utxoTxid,
-        index: utxoVout,
-        witnessUtxo: { script: p2wsh.output!, value: utxoValueSats },
-        witnessScript: p2ms.output!,
-      });
-      psbt.addOutput({ address: to_address, value: amountSats });
-      if (withChange) {
-        psbt.addOutput({ address: p2wsh_address, value: 1n }); // 仅占位，影响结构
-      }
-      return psbt;
-    };
-
     // 先判断有无找零，算出最终手续费，之后只发起一轮远端签名
     const feeWithChange = BigInt(
-      Math.ceil(estimateVsizeWithDummySigs(buildUnsignedPsbt(true)) * feeRate),
+      Math.ceil(
+        estimateVsizeWithDummySigs(
+          buildUnsignedPsbt({
+            targetUtxo,
+            p2wsh: p2wshContext,
+            toAddress: to_address,
+            amountSats,
+            withChange: true,
+          }),
+        ) * feeRate,
+      ),
     );
-    const hasChange = utxoValueSats - amountSats - feeWithChange > 0n;
+    const hasChange = targetUtxo.valueSats - amountSats - feeWithChange > 0n;
     const finalFeeSats = hasChange
       ? feeWithChange
       : BigInt(
           Math.ceil(
-            estimateVsizeWithDummySigs(buildUnsignedPsbt(false)) * feeRate,
+            estimateVsizeWithDummySigs(
+              buildUnsignedPsbt({
+                targetUtxo,
+                p2wsh: p2wshContext,
+                toAddress: to_address,
+                amountSats,
+                withChange: false,
+              }),
+            ) * feeRate,
           ),
         );
-
-    const build = async (feeSats: bigint) => {
-      const change = utxoValueSats - amountSats - feeSats;
-      if (change < 0n) {
-        throw new Error(
-          `余额不足：utxo=${utxoValueSats.toString()} sats, amount=${amountSats.toString()} sats, fee=${feeSats.toString()} sats`,
-        );
-      }
-
-      const psbt = new Psbt({ network: networks.testnet });
-      psbt.addInput({
-        hash: utxoTxid,
-        index: utxoVout,
-        witnessUtxo: {
-          script: p2wsh.output!,
-          value: utxoValueSats,
-        },
-        witnessScript: p2ms.output!,
-      });
-      psbt.addOutput({ address: to_address, value: amountSats });
-      if (change > 0n) {
-        psbt.addOutput({ address: p2wsh_address, value: change });
-      }
-
-      const unsignedPsbtHex = psbt.toHex();
-      // 从 3 个签名方里随机选 2 个拿 partialSig（2-of-3）
-      const signerPool = [...participants];
-      signerPool.sort(() => Math.random() - 0.5);
-      const pickedSigners = signerPool.slice(0, 2);
-      console.log(
-        "picked signers",
-        pickedSigners.map((p) => ({
-          name: p.name,
-          address: p.keyInfo.address,
-          pubkey: p.keyInfo.publicKeyHex,
-        })),
-      );
-      const partialSigs = await Promise.all(
-        pickedSigners.map((p) =>
-          mockPostGetPartialSig(unsignedPsbtHex, p.keyPair),
-        ),
-      );
-
-      psbt.updateInput(0, { partialSig: partialSigs });
-      psbt.finalizeAllInputs();
-      return { psbt, change };
-    };
-
-    const { psbt, change } = await build(finalFeeSats);
+    const { psbt, change } = await buildPsbt({
+      feeSats: finalFeeSats,
+      targetUtxo,
+      amountSats,
+      toAddress: to_address,
+      p2wsh: p2wshContext,
+      participants,
+    });
 
     const tx = psbt.extractTransaction();
     const rawtx = tx.toHex();
     const txid = tx.getId();
     const actualFeeSats =
-      utxoValueSats - tx.outs.reduce((sum, out) => sum + BigInt(out.value), 0n);
+      targetUtxo.valueSats -
+      tx.outs.reduce((sum, out) => sum + BigInt(out.value), 0n);
     const actualVsize = tx.virtualSize();
     const actualFeeRate = Number(actualFeeSats) / actualVsize;
 
